@@ -19,19 +19,20 @@ package org.apache.spark.scheduler
 
 import java.io._
 import java.net.URI
+import java.nio.charset.StandardCharsets
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import com.google.common.base.Charsets
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, FSDataOutputStream, Path}
 import org.apache.hadoop.fs.permission.FsPermission
 import org.json4s.JsonAST.JValue
 import org.json4s.jackson.JsonMethods._
 
-import org.apache.spark.{Logging, SparkConf, SPARK_VERSION}
+import org.apache.spark.{SPARK_VERSION, SparkConf}
 import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.internal.Logging
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.util.{JsonProtocol, Utils}
 
@@ -47,6 +48,7 @@ import org.apache.spark.util.{JsonProtocol, Utils}
  */
 private[spark] class EventLoggingListener(
     appId: String,
+    appAttemptId : Option[String],
     logBaseDir: URI,
     sparkConf: SparkConf,
     hadoopConf: Configuration)
@@ -54,8 +56,9 @@ private[spark] class EventLoggingListener(
 
   import EventLoggingListener._
 
-  def this(appId: String, logBaseDir: URI, sparkConf: SparkConf) =
-    this(appId, logBaseDir, sparkConf, SparkHadoopUtil.get.newConfiguration(sparkConf))
+  def this(appId: String, appAttemptId : Option[String], logBaseDir: URI, sparkConf: SparkConf) =
+    this(appId, appAttemptId, logBaseDir, sparkConf,
+      SparkHadoopUtil.get.newConfiguration(sparkConf))
 
   private val shouldCompress = sparkConf.getBoolean("spark.eventLog.compress", false)
   private val shouldOverwrite = sparkConf.getBoolean("spark.eventLog.overwrite", false)
@@ -75,28 +78,20 @@ private[spark] class EventLoggingListener(
   // Only defined if the file system scheme is not local
   private var hadoopDataStream: Option[FSDataOutputStream] = None
 
-  // The Hadoop APIs have changed over time, so we use reflection to figure out
-  // the correct method to use to flush a hadoop data stream. See SPARK-1518
-  // for details.
-  private val hadoopFlushMethod = {
-    val cls = classOf[FSDataOutputStream]
-    scala.util.Try(cls.getMethod("hflush")).getOrElse(cls.getMethod("sync"))
-  }
-
   private var writer: Option[PrintWriter] = None
 
   // For testing. Keep track of all JSON serialized events that have been logged.
   private[scheduler] val loggedEvents = new ArrayBuffer[JValue]
 
   // Visible for tests only.
-  private[scheduler] val logPath = getLogPath(logBaseDir, appId, compressionCodecName)
+  private[scheduler] val logPath = getLogPath(logBaseDir, appId, appAttemptId, compressionCodecName)
 
   /**
    * Creates the log file in the configured log directory.
    */
   def start() {
-    if (!fileSystem.getFileStatus(new Path(logBaseDir)).isDir) {
-      throw new IllegalArgumentException(s"Log directory $logBaseDir does not exist.")
+    if (!fileSystem.getFileStatus(new Path(logBaseDir)).isDirectory) {
+      throw new IllegalArgumentException(s"Log directory $logBaseDir is not a directory.")
     }
 
     val workingPath = logPath + IN_PROGRESS
@@ -105,9 +100,8 @@ private[spark] class EventLoggingListener(
     val defaultFs = FileSystem.getDefaultUri(hadoopConf).getScheme
     val isDefaultLocal = defaultFs == null || defaultFs == "file"
 
-    if (shouldOverwrite && fileSystem.exists(path)) {
+    if (shouldOverwrite && fileSystem.delete(path, true)) {
       logWarning(s"Event log $path already exists. Overwriting...")
-      fileSystem.delete(path, true)
     }
 
     /* The Hadoop LocalFileSystem (r1.0.4) has known issues with syncing (HADOOP-7844).
@@ -138,10 +132,12 @@ private[spark] class EventLoggingListener(
   /** Log the event as JSON. */
   private def logEvent(event: SparkListenerEvent, flushLogger: Boolean = false) {
     val eventJson = JsonProtocol.sparkEventToJson(event)
+    // scalastyle:off println
     writer.foreach(_.println(compact(render(eventJson))))
+    // scalastyle:on println
     if (flushLogger) {
       writer.foreach(_.flush())
-      hadoopDataStream.foreach(hadoopFlushMethod.invoke(_))
+      hadoopDataStream.foreach(_.hflush())
     }
     if (testing) {
       loggedEvents += eventJson
@@ -196,7 +192,16 @@ private[spark] class EventLoggingListener(
   }
 
   // No-op because logging every update would be overkill
+  override def onBlockUpdated(event: SparkListenerBlockUpdated): Unit = {}
+
+  // No-op because logging every update would be overkill
   override def onExecutorMetricsUpdate(event: SparkListenerExecutorMetricsUpdate): Unit = { }
+
+  override def onOtherEvent(event: SparkListenerEvent): Unit = {
+    if (event.logEvent) {
+      logEvent(event, flushLogger = true)
+    }
+  }
 
   /**
    * Stop logging events. The event log file will be renamed so that it loses the
@@ -209,12 +214,21 @@ private[spark] class EventLoggingListener(
     if (fileSystem.exists(target)) {
       if (shouldOverwrite) {
         logWarning(s"Event log $target already exists. Overwriting...")
-        fileSystem.delete(target, true)
+        if (!fileSystem.delete(target, true)) {
+          logWarning(s"Error deleting $target")
+        }
       } else {
         throw new IOException("Target log file already exists (%s)".format(logPath))
       }
     }
     fileSystem.rename(new Path(logPath + IN_PROGRESS), target)
+    // touch file to ensure modtime is current across those filesystems where rename()
+    // does not set it, -and which support setTimes(); it's a no-op on most object stores
+    try {
+      fileSystem.setTimes(target, System.currentTimeMillis(), -1)
+    } catch {
+      case e: Exception => logDebug(s"failed to set time of $target", e)
+    }
   }
 
 }
@@ -223,8 +237,6 @@ private[spark] object EventLoggingListener extends Logging {
   // Suffix applied to the names of files still being written by applications.
   val IN_PROGRESS = ".inprogress"
   val DEFAULT_LOG_DIR = "/tmp/spark-events"
-  val SPARK_VERSION_KEY = "SPARK_VERSION"
-  val COMPRESSION_CODEC_KEY = "COMPRESSION_CODEC"
 
   private val LOG_FILE_PERMISSIONS = new FsPermission(Integer.parseInt("770", 8).toShort)
 
@@ -240,7 +252,7 @@ private[spark] object EventLoggingListener extends Logging {
   def initEventLog(logStream: OutputStream): Unit = {
     val metadata = SparkListenerLogStart(SPARK_VERSION)
     val metadataJson = compact(JsonProtocol.logStartToJson(metadata)) + "\n"
-    logStream.write(metadataJson.getBytes(Charsets.UTF_8))
+    logStream.write(metadataJson.getBytes(StandardCharsets.UTF_8))
   }
 
   /**
@@ -252,8 +264,12 @@ private[spark] object EventLoggingListener extends Logging {
    * we won't know which codec to use to decompress the metadata needed to open the file in
    * the first place.
    *
+   * The log file name will identify the compression codec used for the contents, if any.
+   * For example, app_123 for an uncompressed log, app_123.lzf for an LZF-compressed log.
+   *
    * @param logBaseDir Directory where the log file will be written.
    * @param appId A unique app ID.
+   * @param appAttemptId A unique attempt id of appId. May be the empty string.
    * @param compressionCodecName Name to identify the codec used to compress the contents
    *                             of the log, or None if compression is not enabled.
    * @return A path which consists of file-system-safe characters.
@@ -261,11 +277,19 @@ private[spark] object EventLoggingListener extends Logging {
   def getLogPath(
       logBaseDir: URI,
       appId: String,
+      appAttemptId: Option[String],
       compressionCodecName: Option[String] = None): String = {
-    val sanitizedAppId = appId.replaceAll("[ :/]", "-").replaceAll("[.${}'\"]", "_").toLowerCase
-    // e.g. app_123, app_123.lzf
-    val logName = sanitizedAppId + compressionCodecName.map { "." + _ }.getOrElse("")
-    logBaseDir.toString.stripSuffix("/") + "/" + logName
+    val base = logBaseDir.toString.stripSuffix("/") + "/" + sanitize(appId)
+    val codec = compressionCodecName.map("." + _).getOrElse("")
+    if (appAttemptId.isDefined) {
+      base + "_" + sanitize(appAttemptId.get) + codec
+    } else {
+      base + codec
+    }
+  }
+
+  private def sanitize(str: String): String = {
+    str.replaceAll("[ :/]", "-").replaceAll("[.${}'\"]", "_").toLowerCase
   }
 
   /**
@@ -274,12 +298,6 @@ private[spark] object EventLoggingListener extends Logging {
    * @return input stream that holds one JSON record per line.
    */
   def openEventLog(log: Path, fs: FileSystem): InputStream = {
-    // It's not clear whether FileSystem.open() throws FileNotFoundException or just plain
-    // IOException when a file does not exist, so try our best to throw a proper exception.
-    if (!fs.exists(log)) {
-      throw new FileNotFoundException(s"File $log does not exist.")
-    }
-
     val in = new BufferedInputStream(fs.open(log))
 
     // Compression codec is encoded as an extension, e.g. app_123.lzf

@@ -17,37 +17,54 @@
 
 package org.apache.spark.ml.feature
 
-import org.apache.spark.annotation.AlphaComponent
+import org.apache.spark.annotation.Since
 import org.apache.spark.ml.UnaryTransformer
-import org.apache.spark.ml.param.{DoubleParam, ParamMap}
+import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.param.{DoubleParam, ParamValidators}
+import org.apache.spark.ml.util._
 import org.apache.spark.mllib.feature
-import org.apache.spark.mllib.linalg.{VectorUDT, Vector}
+import org.apache.spark.mllib.linalg.{Vectors => OldVectors}
 import org.apache.spark.sql.types.DataType
 
 /**
- * :: AlphaComponent ::
  * Normalize a vector to have unit norm using the given p-norm.
  */
-@AlphaComponent
-class Normalizer extends UnaryTransformer[Vector, Vector, Normalizer] {
+@Since("1.4.0")
+class Normalizer @Since("1.4.0") (@Since("1.4.0") override val uid: String)
+  extends UnaryTransformer[Vector, Vector, Normalizer] with DefaultParamsWritable {
+
+  @Since("1.4.0")
+  def this() = this(Identifiable.randomUID("normalizer"))
 
   /**
-   * Normalization in L^p^ space, p = 2 by default.
+   * Normalization in L^p^ space.  Must be >= 1.
+   * (default: p = 2)
    * @group param
    */
-  val p = new DoubleParam(this, "p", "the p norm value", Some(2))
+  @Since("1.4.0")
+  val p = new DoubleParam(this, "p", "the p norm value", ParamValidators.gtEq(1))
+
+  setDefault(p -> 2.0)
 
   /** @group getParam */
-  def getP: Double = get(p)
+  @Since("1.4.0")
+  def getP: Double = $(p)
 
   /** @group setParam */
+  @Since("1.4.0")
   def setP(value: Double): this.type = set(p, value)
 
-  override protected def createTransformFunc(paramMap: ParamMap): Vector => Vector = {
-    val normalizer = new feature.Normalizer(paramMap(p))
-    normalizer.transform
+  override protected def createTransformFunc: Vector => Vector = {
+    val normalizer = new feature.Normalizer($(p))
+    vector => normalizer.transform(OldVectors.fromML(vector)).asML
   }
 
   override protected def outputDataType: DataType = new VectorUDT()
 }
 
+@Since("1.6.0")
+object Normalizer extends DefaultParamsReadable[Normalizer] {
+
+  @Since("1.6.0")
+  override def load(path: String): Normalizer = super.load(path)
+}

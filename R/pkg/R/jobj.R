@@ -16,7 +16,10 @@
 #
 
 # References to objects that exist on the JVM backend
-# are maintained using the jobj. 
+# are maintained using the jobj.
+
+#' @include generics.R
+NULL
 
 # Maintain a reference count of Java object references
 # This allows us to GC the java object when it is safe
@@ -68,10 +71,15 @@ jobj <- function(objId) {
 #'
 #' @param x The JVM object reference
 #' @param ... further arguments passed to or from other methods
+#' @note print.jobj since 1.4.0
 print.jobj <- function(x, ...) {
-  cls <- callJMethod(x, "getClass")
-  name <- callJMethod(cls, "getName")
+  name <- getClassName.jobj(x)
   cat("Java ref type", name, "id", x$id, "\n", sep = " ")
+}
+
+getClassName.jobj <- function(x) {
+  cls <- callJMethod(x, "getClass")
+  callJMethod(cls, "getName")
 }
 
 cleanup.jobj <- function(jobj) {

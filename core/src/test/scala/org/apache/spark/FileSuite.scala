@@ -17,25 +17,25 @@
 
 package org.apache.spark
 
-import java.io.{File, FileWriter}
-
-import org.apache.spark.input.PortableDataStream
-import org.apache.spark.storage.StorageLevel
+import java.io._
+import java.util.zip.GZIPOutputStream
 
 import scala.io.Source
 
 import org.apache.hadoop.io._
 import org.apache.hadoop.io.compress.DefaultCodec
-import org.apache.hadoop.mapred.{JobConf, FileAlreadyExistsException, FileSplit, TextInputFormat, TextOutputFormat}
+import org.apache.hadoop.mapred.{FileAlreadyExistsException, FileSplit, JobConf, TextInputFormat, TextOutputFormat}
 import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.mapreduce.lib.input.{FileSplit => NewFileSplit, TextInputFormat => NewTextInputFormat}
 import org.apache.hadoop.mapreduce.lib.output.{TextOutputFormat => NewTextOutputFormat}
-import org.scalatest.FunSuite
 
-import org.apache.spark.rdd.{NewHadoopRDD, HadoopRDD}
+import org.apache.spark.input.PortableDataStream
+import org.apache.spark.internal.config.IGNORE_CORRUPT_FILES
+import org.apache.spark.rdd.{HadoopRDD, NewHadoopRDD}
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.Utils
 
-class FileSuite extends FunSuite with LocalSparkContext {
+class FileSuite extends SparkFunSuite with LocalSparkContext {
   var tempDir: File = _
 
   override def beforeEach() {
@@ -44,8 +44,11 @@ class FileSuite extends FunSuite with LocalSparkContext {
   }
 
   override def afterEach() {
-    super.afterEach()
-    Utils.deleteRecursively(tempDir)
+    try {
+      Utils.deleteRecursively(tempDir)
+    } finally {
+      super.afterEach()
+    }
   }
 
   test("text files") {
@@ -180,6 +183,7 @@ class FileSuite extends FunSuite with LocalSparkContext {
   }
 
   test("object files of classes from a JAR") {
+    // scalastyle:off classforname
     val original = Thread.currentThread().getContextClassLoader
     val className = "FileSuiteObjectFileTest"
     val jar = TestUtils.createJarWithClasses(Seq(className))
@@ -202,6 +206,7 @@ class FileSuite extends FunSuite with LocalSparkContext {
     finally {
       Thread.currentThread().setContextClassLoader(original)
     }
+    // scalastyle:on classforname
   }
 
   test("write SequenceFile using new Hadoop API") {
@@ -222,7 +227,7 @@ class FileSuite extends FunSuite with LocalSparkContext {
     val nums = sc.makeRDD(1 to 3).map(x => (new IntWritable(x), new Text("a" * x)))
     nums.saveAsSequenceFile(outputDir)
     val output =
-        sc.newAPIHadoopFile[IntWritable, Text, SequenceFileInputFormat[IntWritable, Text]](outputDir)
+      sc.newAPIHadoopFile[IntWritable, Text, SequenceFileInputFormat[IntWritable, Text]](outputDir)
     assert(output.map(_.toString).collect().toList === List("(1,a)", "(2,aa)", "(3,aaa)"))
   }
 
@@ -334,7 +339,7 @@ class FileSuite extends FunSuite with LocalSparkContext {
     }
     val copyRdd = mappedRdd.flatMap {
       curData: (String, PortableDataStream) =>
-        for(i <- 1 to numOfCopies) yield (i, curData._2)
+        for (i <- 1 to numOfCopies) yield (i, curData._2)
     }
 
     val copyArr: Array[(Int, PortableDataStream)] = copyRdd.collect()
@@ -451,7 +456,8 @@ class FileSuite extends FunSuite with LocalSparkContext {
 
   test ("prevent user from overwriting the empty directory (new Hadoop API)") {
     sc = new SparkContext("local", "test")
-    val randomRDD = sc.parallelize(Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
+    val randomRDD = sc.parallelize(
+      Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
     intercept[FileAlreadyExistsException] {
       randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](tempDir.getPath)
     }
@@ -459,8 +465,10 @@ class FileSuite extends FunSuite with LocalSparkContext {
 
   test ("prevent user from overwriting the non-empty directory (new Hadoop API)") {
     sc = new SparkContext("local", "test")
-    val randomRDD = sc.parallelize(Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
-    randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](tempDir.getPath + "/output")
+    val randomRDD = sc.parallelize(
+      Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
+    randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](
+      tempDir.getPath + "/output")
     assert(new File(tempDir.getPath + "/output/part-r-00000").exists() === true)
     intercept[FileAlreadyExistsException] {
       randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](tempDir.getPath)
@@ -471,16 +479,20 @@ class FileSuite extends FunSuite with LocalSparkContext {
     val sf = new SparkConf()
     sf.setAppName("test").setMaster("local").set("spark.hadoop.validateOutputSpecs", "false")
     sc = new SparkContext(sf)
-    val randomRDD = sc.parallelize(Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
-    randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](tempDir.getPath + "/output")
+    val randomRDD = sc.parallelize(
+      Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
+    randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](
+      tempDir.getPath + "/output")
     assert(new File(tempDir.getPath + "/output/part-r-00000").exists() === true)
-    randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](tempDir.getPath + "/output")
+    randomRDD.saveAsNewAPIHadoopFile[NewTextOutputFormat[String, String]](
+      tempDir.getPath + "/output")
     assert(new File(tempDir.getPath + "/output/part-r-00000").exists() === true)
   }
 
   test ("save Hadoop Dataset through old Hadoop API") {
     sc = new SparkContext("local", "test")
-    val randomRDD = sc.parallelize(Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
+    val randomRDD = sc.parallelize(
+      Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
     val job = new JobConf()
     job.setOutputKeyClass(classOf[String])
     job.setOutputValueClass(classOf[String])
@@ -492,13 +504,15 @@ class FileSuite extends FunSuite with LocalSparkContext {
 
   test ("save Hadoop Dataset through new Hadoop API") {
     sc = new SparkContext("local", "test")
-    val randomRDD = sc.parallelize(Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
-    val job = new Job(sc.hadoopConfiguration)
+    val randomRDD = sc.parallelize(
+      Array(("key1", "a"), ("key2", "a"), ("key3", "b"), ("key4", "c")), 1)
+    val job = Job.getInstance(sc.hadoopConfiguration)
     job.setOutputKeyClass(classOf[String])
     job.setOutputValueClass(classOf[String])
     job.setOutputFormatClass(classOf[NewTextOutputFormat[String, String]])
-    job.getConfiguration.set("mapred.output.dir", tempDir.getPath + "/outputDataset_new")
-    randomRDD.saveAsNewAPIHadoopDataset(job.getConfiguration)
+    val jobConfig = job.getConfiguration
+    jobConfig.set("mapred.output.dir", tempDir.getPath + "/outputDataset_new")
+    randomRDD.saveAsNewAPIHadoopDataset(jobConfig)
     assert(new File(tempDir.getPath + "/outputDataset_new/part-r-00000").exists() === true)
   }
 
@@ -529,4 +543,62 @@ class FileSuite extends FunSuite with LocalSparkContext {
         }.collect()
     assert(inputPaths.toSet === Set(s"$outDir/part-00000", s"$outDir/part-00001"))
   }
+
+  test("spark.files.ignoreCorruptFiles should work both HadoopRDD and NewHadoopRDD") {
+    val inputFile = File.createTempFile("input-", ".gz")
+    try {
+      // Create a corrupt gzip file
+      val byteOutput = new ByteArrayOutputStream()
+      val gzip = new GZIPOutputStream(byteOutput)
+      try {
+        gzip.write(Array[Byte](1, 2, 3, 4))
+      } finally {
+        gzip.close()
+      }
+      val bytes = byteOutput.toByteArray
+      val o = new FileOutputStream(inputFile)
+      try {
+        // It's corrupt since we only write half of bytes into the file.
+        o.write(bytes.take(bytes.length / 2))
+      } finally {
+        o.close()
+      }
+
+      // Reading a corrupt gzip file should throw EOFException
+      sc = new SparkContext("local", "test")
+      // Test HadoopRDD
+      var e = intercept[SparkException] {
+        sc.textFile(inputFile.toURI.toString).collect()
+      }
+      assert(e.getCause.isInstanceOf[EOFException])
+      assert(e.getCause.getMessage === "Unexpected end of input stream")
+      // Test NewHadoopRDD
+      e = intercept[SparkException] {
+        sc.newAPIHadoopFile(
+          inputFile.toURI.toString,
+          classOf[NewTextInputFormat],
+          classOf[LongWritable],
+          classOf[Text]).collect()
+      }
+      assert(e.getCause.isInstanceOf[EOFException])
+      assert(e.getCause.getMessage === "Unexpected end of input stream")
+      sc.stop()
+
+      val conf = new SparkConf().set(IGNORE_CORRUPT_FILES, true)
+      sc = new SparkContext("local", "test", conf)
+      // Test HadoopRDD
+      assert(sc.textFile(inputFile.toURI.toString).collect().isEmpty)
+      // Test NewHadoopRDD
+      assert {
+        sc.newAPIHadoopFile(
+          inputFile.toURI.toString,
+          classOf[NewTextInputFormat],
+          classOf[LongWritable],
+          classOf[Text]).collect().isEmpty
+      }
+    } finally {
+      inputFile.delete()
+    }
+  }
+
 }

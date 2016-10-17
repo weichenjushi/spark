@@ -32,6 +32,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
 from pyspark.resultiterable import ResultIterable
+from functools import reduce
 
 
 def _do_python_join(rdd, other, numPartitions, dispatch):
@@ -92,7 +93,7 @@ def python_full_outer_join(rdd, other, numPartitions):
             vbuf.append(None)
         if not wbuf:
             wbuf.append(None)
-        return [(v, w) for v in vbuf for w in wbuf]
+        return ((v, w) for v in vbuf for w in wbuf)
     return _do_python_join(rdd, other, numPartitions, dispatch)
 
 

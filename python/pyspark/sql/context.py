@@ -15,84 +15,73 @@
 # limitations under the License.
 #
 
+from __future__ import print_function
+import sys
 import warnings
-import json
-from itertools import imap
 
-from py4j.protocol import Py4JError
-from py4j.java_collections import MapConverter
+if sys.version >= '3':
+    basestring = unicode = str
 
-from pyspark.rdd import RDD, _prepare_for_python_RDD
-from pyspark.serializers import AutoBatchedSerializer, PickleSerializer
-from pyspark.sql.types import Row, StringType, StructType, _verify_type, \
-    _infer_schema, _has_nulltype, _merge_type, _create_converter, _python_to_sql_converter
+from pyspark import since
+from pyspark.rdd import ignore_unicode_prefix
+from pyspark.sql.session import _monkey_patch_RDD, SparkSession
 from pyspark.sql.dataframe import DataFrame
-
-try:
-    import pandas
-    has_pandas = True
-except ImportError:
-    has_pandas = False
+from pyspark.sql.readwriter import DataFrameReader
+from pyspark.sql.streaming import DataStreamReader
+from pyspark.sql.types import IntegerType, Row, StringType
+from pyspark.sql.utils import install_exception_handler
 
 __all__ = ["SQLContext", "HiveContext", "UDFRegistration"]
 
 
-def _monkey_patch_RDD(sqlContext):
-    def toDF(self, schema=None, sampleRatio=None):
-        """
-        Converts current :class:`RDD` into a :class:`DataFrame`
-
-        This is a shorthand for ``sqlContext.createDataFrame(rdd, schema, sampleRatio)``
-
-        :param schema: a StructType or list of names of columns
-        :param samplingRatio: the sample ratio of rows used for inferring
-        :return: a DataFrame
-
-        >>> rdd.toDF().collect()
-        [Row(name=u'Alice', age=1)]
-        """
-        return sqlContext.createDataFrame(self, schema, sampleRatio)
-
-    RDD.toDF = toDF
-
-
 class SQLContext(object):
-    """Main entry point for Spark SQL functionality.
+    """The entry point for working with structured data (rows and columns) in Spark, in Spark 1.x.
+
+    As of Spark 2.0, this is replaced by :class:`SparkSession`. However, we are keeping the class
+    here for backward compatibility.
 
     A SQLContext can be used create :class:`DataFrame`, register :class:`DataFrame` as
     tables, execute SQL over tables, cache tables, and read parquet files.
 
-    When created, :class:`SQLContext` adds a method called ``toDF`` to :class:`RDD`,
-    which could be used to convert an RDD into a DataFrame, it's a shorthand for
-    :func:`SQLContext.createDataFrame`.
-
     :param sparkContext: The :class:`SparkContext` backing this SQLContext.
-    :param sqlContext: An optional JVM Scala SQLContext. If set, we do not instantiate a new
+    :param sparkSession: The :class:`SparkSession` around which this SQLContext wraps.
+    :param jsqlContext: An optional JVM Scala SQLContext. If set, we do not instantiate a new
         SQLContext in the JVM, instead we make all calls to this object.
     """
 
-    def __init__(self, sparkContext, sqlContext=None):
+    _instantiatedContext = None
+
+    @ignore_unicode_prefix
+    def __init__(self, sparkContext, sparkSession=None, jsqlContext=None):
         """Creates a new SQLContext.
 
         >>> from datetime import datetime
         >>> sqlContext = SQLContext(sc)
-        >>> allTypes = sc.parallelize([Row(i=1, s="string", d=1.0, l=1L,
+        >>> allTypes = sc.parallelize([Row(i=1, s="string", d=1.0, l=1,
         ...     b=True, list=[1, 2, 3], dict={"s": 0}, row=Row(a=1),
         ...     time=datetime(2014, 8, 1, 14, 1, 5))])
         >>> df = allTypes.toDF()
-        >>> df.registerTempTable("allTypes")
+        >>> df.createOrReplaceTempView("allTypes")
         >>> sqlContext.sql('select i+1, d+1, not b, list[1], dict["s"], time, row.a '
         ...            'from allTypes where b and i > 0').collect()
-        [Row(c0=2, c1=2.0, c2=False, c3=2, c4=0...8, 1, 14, 1, 5), a=1)]
-        >>> df.map(lambda x: (x.i, x.s, x.d, x.l, x.b, x.time,
-        ...                     x.row.a, x.list)).collect()
-        [(1, u'string', 1.0, 1, True, ...(2014, 8, 1, 14, 1, 5), 1, [1, 2, 3])]
+        [Row((i + CAST(1 AS BIGINT))=2, (d + CAST(1 AS DOUBLE))=2.0, (NOT b)=False, list[1]=2, \
+            dict[s]=0, time=datetime.datetime(2014, 8, 1, 14, 1, 5), a=1)]
+        >>> df.rdd.map(lambda x: (x.i, x.s, x.d, x.l, x.b, x.time, x.row.a, x.list)).collect()
+        [(1, u'string', 1.0, 1, True, datetime.datetime(2014, 8, 1, 14, 1, 5), 1, [1, 2, 3])]
         """
         self._sc = sparkContext
         self._jsc = self._sc._jsc
         self._jvm = self._sc._jvm
-        self._scala_SQLContext = sqlContext
-        _monkey_patch_RDD(self)
+        if sparkSession is None:
+            sparkSession = SparkSession(sparkContext)
+        if jsqlContext is None:
+            jsqlContext = sparkSession._jwrapped
+        self.sparkSession = sparkSession
+        self._jsqlContext = jsqlContext
+        _monkey_patch_RDD(self.sparkSession)
+        install_exception_handler()
+        if SQLContext._instantiatedContext is None:
+            SQLContext._instantiatedContext = self
 
     @property
     def _ssql_ctx(self):
@@ -101,117 +90,160 @@ class SQLContext(object):
         Subclasses can override this property to provide their own
         JVM Contexts.
         """
-        if self._scala_SQLContext is None:
-            self._scala_SQLContext = self._jvm.SQLContext(self._jsc.sc())
-        return self._scala_SQLContext
+        return self._jsqlContext
 
+    @classmethod
+    @since(1.6)
+    def getOrCreate(cls, sc):
+        """
+        Get the existing SQLContext or create a new one with given SparkContext.
+
+        :param sc: SparkContext
+        """
+        if cls._instantiatedContext is None:
+            jsqlContext = sc._jvm.SQLContext.getOrCreate(sc._jsc.sc())
+            sparkSession = SparkSession(sc, jsqlContext.sparkSession())
+            cls(sc, sparkSession, jsqlContext)
+        return cls._instantiatedContext
+
+    @since(1.6)
+    def newSession(self):
+        """
+        Returns a new SQLContext as new session, that has separate SQLConf,
+        registered temporary views and UDFs, but shared SparkContext and
+        table cache.
+        """
+        return self.__class__(self._sc, self.sparkSession.newSession())
+
+    @since(1.3)
     def setConf(self, key, value):
         """Sets the given Spark SQL configuration property.
         """
-        self._ssql_ctx.setConf(key, value)
+        self.sparkSession.conf.set(key, value)
 
-    def getConf(self, key, defaultValue):
+    @ignore_unicode_prefix
+    @since(1.3)
+    def getConf(self, key, defaultValue=None):
         """Returns the value of Spark SQL configuration property for the given key.
 
-        If the key is not set, returns defaultValue.
+        If the key is not set and defaultValue is not None, return
+        defaultValue. If the key is not set and defaultValue is None, return
+        the system default value.
+
+        >>> sqlContext.getConf("spark.sql.shuffle.partitions")
+        u'200'
+        >>> sqlContext.getConf("spark.sql.shuffle.partitions", u"10")
+        u'10'
+        >>> sqlContext.setConf("spark.sql.shuffle.partitions", u"50")
+        >>> sqlContext.getConf("spark.sql.shuffle.partitions", u"10")
+        u'50'
         """
-        return self._ssql_ctx.getConf(key, defaultValue)
+        return self.sparkSession.conf.get(key, defaultValue)
 
     @property
+    @since("1.3.1")
     def udf(self):
-        """Returns a :class:`UDFRegistration` for UDF registration."""
+        """Returns a :class:`UDFRegistration` for UDF registration.
+
+        :return: :class:`UDFRegistration`
+        """
         return UDFRegistration(self)
 
+    @since(1.4)
+    def range(self, start, end=None, step=1, numPartitions=None):
+        """
+        Create a :class:`DataFrame` with single :class:`pyspark.sql.types.LongType` column named
+        ``id``, containing elements in a range from ``start`` to ``end`` (exclusive) with
+        step value ``step``.
+
+        :param start: the start value
+        :param end: the end value (exclusive)
+        :param step: the incremental step (default: 1)
+        :param numPartitions: the number of partitions of the DataFrame
+        :return: :class:`DataFrame`
+
+        >>> sqlContext.range(1, 7, 2).collect()
+        [Row(id=1), Row(id=3), Row(id=5)]
+
+        If only one argument is specified, it will be used as the end value.
+
+        >>> sqlContext.range(3).collect()
+        [Row(id=0), Row(id=1), Row(id=2)]
+        """
+        return self.sparkSession.range(start, end, step, numPartitions)
+
+    @ignore_unicode_prefix
+    @since(1.2)
     def registerFunction(self, name, f, returnType=StringType()):
-        """Registers a lambda function as a UDF so it can be used in SQL statements.
+        """Registers a python function (including lambda function) as a UDF
+        so it can be used in SQL statements.
 
         In addition to a name and the function itself, the return type can be optionally specified.
         When the return type is not given it default to a string and conversion will automatically
         be done.  For any other return type, the produced object must match the specified type.
 
         :param name: name of the UDF
-        :param samplingRatio: lambda function
-        :param returnType: a :class:`DataType` object
+        :param f: python function
+        :param returnType: a :class:`pyspark.sql.types.DataType` object
 
         >>> sqlContext.registerFunction("stringLengthString", lambda x: len(x))
         >>> sqlContext.sql("SELECT stringLengthString('test')").collect()
-        [Row(c0=u'4')]
+        [Row(stringLengthString(test)=u'4')]
 
         >>> from pyspark.sql.types import IntegerType
         >>> sqlContext.registerFunction("stringLengthInt", lambda x: len(x), IntegerType())
         >>> sqlContext.sql("SELECT stringLengthInt('test')").collect()
-        [Row(c0=4)]
+        [Row(stringLengthInt(test)=4)]
 
         >>> from pyspark.sql.types import IntegerType
         >>> sqlContext.udf.register("stringLengthInt", lambda x: len(x), IntegerType())
         >>> sqlContext.sql("SELECT stringLengthInt('test')").collect()
-        [Row(c0=4)]
+        [Row(stringLengthInt(test)=4)]
         """
-        func = lambda _, it: imap(lambda x: f(*x), it)
-        ser = AutoBatchedSerializer(PickleSerializer())
-        command = (func, None, ser, ser)
-        pickled_cmd, bvars, env, includes = _prepare_for_python_RDD(self._sc, command, self)
-        self._ssql_ctx.udf().registerPython(name,
-                                            bytearray(pickled_cmd),
-                                            env,
-                                            includes,
-                                            self._sc.pythonExec,
-                                            bvars,
-                                            self._sc._javaAccumulator,
-                                            returnType.json())
+        self.sparkSession.catalog.registerFunction(name, f, returnType)
 
+    @ignore_unicode_prefix
+    @since(2.1)
+    def registerJavaFunction(self, name, javaClassName, returnType=None):
+        """Register a java UDF so it can be used in SQL statements.
+
+        In addition to a name and the function itself, the return type can be optionally specified.
+        When the return type is not specified we would infer it via reflection.
+        :param name:  name of the UDF
+        :param javaClassName: fully qualified name of java class
+        :param returnType: a :class:`pyspark.sql.types.DataType` object
+
+        >>> sqlContext.registerJavaFunction("javaStringLength",
+        ...   "test.org.apache.spark.sql.JavaStringLength", IntegerType())
+        >>> sqlContext.sql("SELECT javaStringLength('test')").collect()
+        [Row(UDF(test)=4)]
+        >>> sqlContext.registerJavaFunction("javaStringLength2",
+        ...   "test.org.apache.spark.sql.JavaStringLength")
+        >>> sqlContext.sql("SELECT javaStringLength2('test')").collect()
+        [Row(UDF(test)=4)]
+
+        """
+        jdt = None
+        if returnType is not None:
+            jdt = self.sparkSession._jsparkSession.parseDataType(returnType.json())
+        self.sparkSession._jsparkSession.udf().registerJava(name, javaClassName, jdt)
+
+    # TODO(andrew): delete this once we refactor things to take in SparkSession
     def _inferSchema(self, rdd, samplingRatio=None):
-        first = rdd.first()
-        if not first:
-            raise ValueError("The first row in RDD is empty, "
-                             "can not infer schema")
-        if type(first) is dict:
-            warnings.warn("Using RDD of dict to inferSchema is deprecated,"
-                          "please use pyspark.sql.Row instead")
-
-        if samplingRatio is None:
-            schema = _infer_schema(first)
-            if _has_nulltype(schema):
-                for row in rdd.take(100)[1:]:
-                    schema = _merge_type(schema, _infer_schema(row))
-                    if not _has_nulltype(schema):
-                        break
-                else:
-                    raise ValueError("Some of types cannot be determined by the "
-                                     "first 100 rows, please try again with sampling")
-        else:
-            if samplingRatio < 0.99:
-                rdd = rdd.sample(False, float(samplingRatio))
-            schema = rdd.map(_infer_schema).reduce(_merge_type)
-        return schema
-
-    def inferSchema(self, rdd, samplingRatio=None):
-        """::note: Deprecated in 1.3, use :func:`createDataFrame` instead.
         """
-        warnings.warn("inferSchema is deprecated, please use createDataFrame instead")
+        Infer schema from an RDD of Row or tuple.
 
-        if isinstance(rdd, DataFrame):
-            raise TypeError("Cannot apply schema to DataFrame")
-
-        return self.createDataFrame(rdd, None, samplingRatio)
-
-    def applySchema(self, rdd, schema):
-        """::note: Deprecated in 1.3, use :func:`createDataFrame` instead.
+        :param rdd: an RDD of Row or tuple
+        :param samplingRatio: sampling ratio, or no sampling (default)
+        :return: :class:`pyspark.sql.types.StructType`
         """
-        warnings.warn("applySchema is deprecated, please use createDataFrame instead")
+        return self.sparkSession._inferSchema(rdd, samplingRatio)
 
-        if isinstance(rdd, DataFrame):
-            raise TypeError("Cannot apply schema to DataFrame")
-
-        if not isinstance(schema, StructType):
-            raise TypeError("schema should be StructType, but got %s" % schema)
-
-        return self.createDataFrame(rdd, schema)
-
-    def createDataFrame(self, data, schema=None, samplingRatio=None):
+    @since(1.3)
+    @ignore_unicode_prefix
+    def createDataFrame(self, data, schema=None, samplingRatio=None, verifySchema=True):
         """
-        Creates a :class:`DataFrame` from an :class:`RDD` of :class:`tuple`/:class:`list`,
-        list or :class:`pandas.DataFrame`.
+        Creates a :class:`DataFrame` from an :class:`RDD`, a list or a :class:`pandas.DataFrame`.
 
         When ``schema`` is a list of column names, the type of each column
         will be inferred from ``data``.
@@ -220,13 +252,36 @@ class SQLContext(object):
         from ``data``, which should be an RDD of :class:`Row`,
         or :class:`namedtuple`, or :class:`dict`.
 
+        When ``schema`` is :class:`pyspark.sql.types.DataType` or a datatype string it must match
+        the real data, or an exception will be thrown at runtime. If the given schema is not
+        :class:`pyspark.sql.types.StructType`, it will be wrapped into a
+        :class:`pyspark.sql.types.StructType` as its only field, and the field name will be "value",
+        each record will also be wrapped into a tuple, which can be converted to row later.
+
         If schema inference is needed, ``samplingRatio`` is used to determined the ratio of
         rows used for schema inference. The first row will be used if ``samplingRatio`` is ``None``.
 
-        :param data: an RDD of :class:`Row`/:class:`tuple`/:class:`list`/:class:`dict`,
-            :class:`list`, or :class:`pandas.DataFrame`.
-        :param schema: a :class:`StructType` or list of column names. default None.
+        :param data: an RDD of any kind of SQL data representation(e.g. :class:`Row`,
+            :class:`tuple`, ``int``, ``boolean``, etc.), or :class:`list`, or
+            :class:`pandas.DataFrame`.
+        :param schema: a :class:`pyspark.sql.types.DataType` or a datatype string or a list of
+            column names, default is None.  The data type string format equals to
+            :class:`pyspark.sql.types.DataType.simpleString`, except that top level struct type can
+            omit the ``struct<>`` and atomic types use ``typeName()`` as their format, e.g. use
+            ``byte`` instead of ``tinyint`` for :class:`pyspark.sql.types.ByteType`.
+            We can also use ``int`` as a short name for :class:`pyspark.sql.types.IntegerType`.
         :param samplingRatio: the sample ratio of rows used for inferring
+        :param verifySchema: verify data types of every row against schema.
+        :return: :class:`DataFrame`
+
+        .. versionchanged:: 2.0
+           The ``schema`` parameter can be a :class:`pyspark.sql.types.DataType` or a
+           datatype string after 2.0.
+           If it's not a :class:`pyspark.sql.types.StructType`, it will be wrapped into a
+           :class:`pyspark.sql.types.StructType` and each record will also be wrapped into a tuple.
+
+        .. versionchanged:: 2.1
+           Added verifySchema.
 
         >>> l = [('Alice', 1)]
         >>> sqlContext.createDataFrame(l).collect()
@@ -262,55 +317,22 @@ class SQLContext(object):
 
         >>> sqlContext.createDataFrame(df.toPandas()).collect()  # doctest: +SKIP
         [Row(name=u'Alice', age=1)]
+        >>> sqlContext.createDataFrame(pandas.DataFrame([[1, 2]])).collect()  # doctest: +SKIP
+        [Row(0=1, 1=2)]
+
+        >>> sqlContext.createDataFrame(rdd, "a: string, b: int").collect()
+        [Row(a=u'Alice', b=1)]
+        >>> rdd = rdd.map(lambda row: row[1])
+        >>> sqlContext.createDataFrame(rdd, "int").collect()
+        [Row(value=1)]
+        >>> sqlContext.createDataFrame(rdd, "boolean").collect() # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+            ...
+        Py4JJavaError: ...
         """
-        if isinstance(data, DataFrame):
-            raise TypeError("data is already a DataFrame")
+        return self.sparkSession.createDataFrame(data, schema, samplingRatio, verifySchema)
 
-        if has_pandas and isinstance(data, pandas.DataFrame):
-            if schema is None:
-                schema = list(data.columns)
-            data = [r.tolist() for r in data.to_records(index=False)]
-
-        if not isinstance(data, RDD):
-            try:
-                # data could be list, tuple, generator ...
-                rdd = self._sc.parallelize(data)
-            except Exception:
-                raise ValueError("cannot create an RDD from type: %s" % type(data))
-        else:
-            rdd = data
-
-        if schema is None:
-            schema = self._inferSchema(rdd, samplingRatio)
-            converter = _create_converter(schema)
-            rdd = rdd.map(converter)
-
-        if isinstance(schema, (list, tuple)):
-            first = rdd.first()
-            if not isinstance(first, (list, tuple)):
-                raise ValueError("each row in `rdd` should be list or tuple, "
-                                 "but got %r" % type(first))
-            row_cls = Row(*schema)
-            schema = self._inferSchema(rdd.map(lambda r: row_cls(*r)), samplingRatio)
-
-        # take the first few rows to verify schema
-        rows = rdd.take(10)
-        # Row() cannot been deserialized by Pyrolite
-        if rows and isinstance(rows[0], tuple) and rows[0].__class__.__name__ == 'Row':
-            rdd = rdd.map(tuple)
-            rows = rdd.take(10)
-
-        for row in rows:
-            _verify_type(row, schema)
-
-        # convert python objects to sql data
-        converter = _python_to_sql_converter(schema)
-        rdd = rdd.map(converter)
-
-        jrdd = self._jvm.SerDeUtil.toJavaArray(rdd._to_java_object_rdd())
-        df = self._ssql_ctx.applySchemaToPythonRDD(jrdd.rdd(), schema.json())
-        return DataFrame(df, self)
-
+    @since(1.3)
     def registerDataFrameAsTable(self, df, tableName):
         """Registers the given :class:`DataFrame` as a temporary table in the catalog.
 
@@ -318,137 +340,19 @@ class SQLContext(object):
 
         >>> sqlContext.registerDataFrameAsTable(df, "table1")
         """
-        if (df.__class__ is DataFrame):
-            self._ssql_ctx.registerDataFrameAsTable(df._jdf, tableName)
-        else:
-            raise ValueError("Can only register DataFrame as table")
+        df.createOrReplaceTempView(tableName)
 
-    def parquetFile(self, *paths):
-        """Loads a Parquet file, returning the result as a :class:`DataFrame`.
+    @since(1.6)
+    def dropTempTable(self, tableName):
+        """ Remove the temp table from catalog.
 
-        >>> import tempfile, shutil
-        >>> parquetFile = tempfile.mkdtemp()
-        >>> shutil.rmtree(parquetFile)
-        >>> df.saveAsParquetFile(parquetFile)
-        >>> df2 = sqlContext.parquetFile(parquetFile)
-        >>> sorted(df.collect()) == sorted(df2.collect())
-        True
+        >>> sqlContext.registerDataFrameAsTable(df, "table1")
+        >>> sqlContext.dropTempTable("table1")
         """
-        gateway = self._sc._gateway
-        jpaths = gateway.new_array(gateway.jvm.java.lang.String, len(paths))
-        for i in range(0, len(paths)):
-            jpaths[i] = paths[i]
-        jdf = self._ssql_ctx.parquetFile(jpaths)
-        return DataFrame(jdf, self)
+        self.sparkSession.catalog.dropTempView(tableName)
 
-    def jsonFile(self, path, schema=None, samplingRatio=1.0):
-        """Loads a text file storing one JSON object per line as a :class:`DataFrame`.
-
-        If the schema is provided, applies the given schema to this JSON dataset.
-        Otherwise, it samples the dataset with ratio ``samplingRatio`` to determine the schema.
-
-        >>> import tempfile, shutil
-        >>> jsonFile = tempfile.mkdtemp()
-        >>> shutil.rmtree(jsonFile)
-        >>> with open(jsonFile, 'w') as f:
-        ...     f.writelines(jsonStrings)
-        >>> df1 = sqlContext.jsonFile(jsonFile)
-        >>> df1.printSchema()
-        root
-         |-- field1: long (nullable = true)
-         |-- field2: string (nullable = true)
-         |-- field3: struct (nullable = true)
-         |    |-- field4: long (nullable = true)
-
-        >>> from pyspark.sql.types import *
-        >>> schema = StructType([
-        ...     StructField("field2", StringType()),
-        ...     StructField("field3",
-        ...         StructType([StructField("field5", ArrayType(IntegerType()))]))])
-        >>> df2 = sqlContext.jsonFile(jsonFile, schema)
-        >>> df2.printSchema()
-        root
-         |-- field2: string (nullable = true)
-         |-- field3: struct (nullable = true)
-         |    |-- field5: array (nullable = true)
-         |    |    |-- element: integer (containsNull = true)
-        """
-        if schema is None:
-            df = self._ssql_ctx.jsonFile(path, samplingRatio)
-        else:
-            scala_datatype = self._ssql_ctx.parseDataType(schema.json())
-            df = self._ssql_ctx.jsonFile(path, scala_datatype)
-        return DataFrame(df, self)
-
-    def jsonRDD(self, rdd, schema=None, samplingRatio=1.0):
-        """Loads an RDD storing one JSON object per string as a :class:`DataFrame`.
-
-        If the schema is provided, applies the given schema to this JSON dataset.
-        Otherwise, it samples the dataset with ratio ``samplingRatio`` to determine the schema.
-
-        >>> df1 = sqlContext.jsonRDD(json)
-        >>> df1.first()
-        Row(field1=1, field2=u'row1', field3=Row(field4=11, field5=None), field6=None)
-
-        >>> df2 = sqlContext.jsonRDD(json, df1.schema)
-        >>> df2.first()
-        Row(field1=1, field2=u'row1', field3=Row(field4=11, field5=None), field6=None)
-
-        >>> from pyspark.sql.types import *
-        >>> schema = StructType([
-        ...     StructField("field2", StringType()),
-        ...     StructField("field3",
-        ...                 StructType([StructField("field5", ArrayType(IntegerType()))]))
-        ... ])
-        >>> df3 = sqlContext.jsonRDD(json, schema)
-        >>> df3.first()
-        Row(field2=u'row1', field3=Row(field5=None))
-        """
-
-        def func(iterator):
-            for x in iterator:
-                if not isinstance(x, basestring):
-                    x = unicode(x)
-                if isinstance(x, unicode):
-                    x = x.encode("utf-8")
-                yield x
-        keyed = rdd.mapPartitions(func)
-        keyed._bypass_serializer = True
-        jrdd = keyed._jrdd.map(self._jvm.BytesToString())
-        if schema is None:
-            df = self._ssql_ctx.jsonRDD(jrdd.rdd(), samplingRatio)
-        else:
-            scala_datatype = self._ssql_ctx.parseDataType(schema.json())
-            df = self._ssql_ctx.jsonRDD(jrdd.rdd(), scala_datatype)
-        return DataFrame(df, self)
-
-    def load(self, path=None, source=None, schema=None, **options):
-        """Returns the dataset in a data source as a :class:`DataFrame`.
-
-        The data source is specified by the ``source`` and a set of ``options``.
-        If ``source`` is not specified, the default data source configured by
-        ``spark.sql.sources.default`` will be used.
-
-        Optionally, a schema can be provided as the schema of the returned DataFrame.
-        """
-        if path is not None:
-            options["path"] = path
-        if source is None:
-            source = self.getConf("spark.sql.sources.default",
-                                  "org.apache.spark.sql.parquet")
-        joptions = MapConverter().convert(options,
-                                          self._sc._gateway._gateway_client)
-        if schema is None:
-            df = self._ssql_ctx.load(source, joptions)
-        else:
-            if not isinstance(schema, StructType):
-                raise TypeError("schema should be StructType")
-            scala_datatype = self._ssql_ctx.parseDataType(schema.json())
-            df = self._ssql_ctx.load(source, scala_datatype, joptions)
-        return DataFrame(df, self)
-
-    def createExternalTable(self, tableName, path=None, source=None,
-                            schema=None, **options):
+    @since(1.3)
+    def createExternalTable(self, tableName, path=None, source=None, schema=None, **options):
         """Creates an external table based on the dataset in a data source.
 
         It returns the DataFrame associated with the external table.
@@ -459,44 +363,41 @@ class SQLContext(object):
 
         Optionally, a schema can be provided as the schema of the returned :class:`DataFrame` and
         created external table.
-        """
-        if path is not None:
-            options["path"] = path
-        if source is None:
-            source = self.getConf("spark.sql.sources.default",
-                                  "org.apache.spark.sql.parquet")
-        joptions = MapConverter().convert(options,
-                                          self._sc._gateway._gateway_client)
-        if schema is None:
-            df = self._ssql_ctx.createExternalTable(tableName, source, joptions)
-        else:
-            if not isinstance(schema, StructType):
-                raise TypeError("schema should be StructType")
-            scala_datatype = self._ssql_ctx.parseDataType(schema.json())
-            df = self._ssql_ctx.createExternalTable(tableName, source, scala_datatype,
-                                                    joptions)
-        return DataFrame(df, self)
 
+        :return: :class:`DataFrame`
+        """
+        return self.sparkSession.catalog.createExternalTable(
+            tableName, path, source, schema, **options)
+
+    @ignore_unicode_prefix
+    @since(1.0)
     def sql(self, sqlQuery):
         """Returns a :class:`DataFrame` representing the result of the given query.
+
+        :return: :class:`DataFrame`
 
         >>> sqlContext.registerDataFrameAsTable(df, "table1")
         >>> df2 = sqlContext.sql("SELECT field1 AS f1, field2 as f2 from table1")
         >>> df2.collect()
         [Row(f1=1, f2=u'row1'), Row(f1=2, f2=u'row2'), Row(f1=3, f2=u'row3')]
         """
-        return DataFrame(self._ssql_ctx.sql(sqlQuery), self)
+        return self.sparkSession.sql(sqlQuery)
 
+    @since(1.0)
     def table(self, tableName):
         """Returns the specified table as a :class:`DataFrame`.
+
+        :return: :class:`DataFrame`
 
         >>> sqlContext.registerDataFrameAsTable(df, "table1")
         >>> df2 = sqlContext.table("table1")
         >>> sorted(df.collect()) == sorted(df2.collect())
         True
         """
-        return DataFrame(self._ssql_ctx.table(tableName), self)
+        return self.sparkSession.table(tableName)
 
+    @ignore_unicode_prefix
+    @since(1.3)
     def tables(self, dbName=None):
         """Returns a :class:`DataFrame` containing names of tables in the given database.
 
@@ -505,25 +406,30 @@ class SQLContext(object):
         The returned DataFrame has two columns: ``tableName`` and ``isTemporary``
         (a column with :class:`BooleanType` indicating if a table is a temporary one or not).
 
+        :param dbName: string, name of the database to use.
+        :return: :class:`DataFrame`
+
         >>> sqlContext.registerDataFrameAsTable(df, "table1")
         >>> df2 = sqlContext.tables()
         >>> df2.filter("tableName = 'table1'").first()
-        Row(tableName=u'table1', isTemporary=True)
+        Row(database=u'', tableName=u'table1', isTemporary=True)
         """
         if dbName is None:
             return DataFrame(self._ssql_ctx.tables(), self)
         else:
             return DataFrame(self._ssql_ctx.tables(dbName), self)
 
+    @since(1.3)
     def tableNames(self, dbName=None):
         """Returns a list of names of tables in the database ``dbName``.
 
-        If ``dbName`` is not specified, the current database will be used.
+        :param dbName: string, name of the database to use. Default to the current database.
+        :return: list of table names, in string
 
         >>> sqlContext.registerDataFrameAsTable(df, "table1")
         >>> "table1" in sqlContext.tableNames()
         True
-        >>> "table1" in sqlContext.tableNames("db")
+        >>> "table1" in sqlContext.tableNames("default")
         True
         """
         if dbName is None:
@@ -531,17 +437,59 @@ class SQLContext(object):
         else:
             return [name for name in self._ssql_ctx.tableNames(dbName)]
 
+    @since(1.0)
     def cacheTable(self, tableName):
         """Caches the specified table in-memory."""
         self._ssql_ctx.cacheTable(tableName)
 
+    @since(1.0)
     def uncacheTable(self, tableName):
         """Removes the specified table from the in-memory cache."""
         self._ssql_ctx.uncacheTable(tableName)
 
+    @since(1.3)
     def clearCache(self):
         """Removes all cached tables from the in-memory cache. """
         self._ssql_ctx.clearCache()
+
+    @property
+    @since(1.4)
+    def read(self):
+        """
+        Returns a :class:`DataFrameReader` that can be used to read data
+        in as a :class:`DataFrame`.
+
+        :return: :class:`DataFrameReader`
+        """
+        return DataFrameReader(self)
+
+    @property
+    @since(2.0)
+    def readStream(self):
+        """
+        Returns a :class:`DataStreamReader` that can be used to read data streams
+        as a streaming :class:`DataFrame`.
+
+        .. note:: Experimental.
+
+        :return: :class:`DataStreamReader`
+
+        >>> text_sdf = sqlContext.readStream.text(tempfile.mkdtemp())
+        >>> text_sdf.isStreaming
+        True
+        """
+        return DataStreamReader(self)
+
+    @property
+    @since(2.0)
+    def streams(self):
+        """Returns a :class:`StreamingQueryManager` that allows managing all the
+        :class:`StreamingQuery` StreamingQueries active on `this` context.
+
+        .. note:: Experimental.
+        """
+        from pyspark.sql.streaming import StreamingQueryManager
+        return StreamingQueryManager(self._ssql_ctx.streams())
 
 
 class HiveContext(SQLContext):
@@ -551,28 +499,34 @@ class HiveContext(SQLContext):
     It supports running both SQL and HiveQL commands.
 
     :param sparkContext: The SparkContext to wrap.
-    :param hiveContext: An optional JVM Scala HiveContext. If set, we do not instantiate a new
+    :param jhiveContext: An optional JVM Scala HiveContext. If set, we do not instantiate a new
         :class:`HiveContext` in the JVM, instead we make all calls to this object.
+
+    .. note:: Deprecated in 2.0.0. Use SparkSession.builder.enableHiveSupport().getOrCreate().
     """
 
-    def __init__(self, sparkContext, hiveContext=None):
-        SQLContext.__init__(self, sparkContext)
-        if hiveContext:
-            self._scala_HiveContext = hiveContext
+    def __init__(self, sparkContext, jhiveContext=None):
+        warnings.warn(
+            "HiveContext is deprecated in Spark 2.0.0. Please use " +
+            "SparkSession.builder.enableHiveSupport().getOrCreate() instead.",
+            DeprecationWarning)
+        if jhiveContext is None:
+            sparkSession = SparkSession.builder.enableHiveSupport().getOrCreate()
+        else:
+            sparkSession = SparkSession(sparkContext, jhiveContext.sparkSession())
+        SQLContext.__init__(self, sparkContext, sparkSession, jhiveContext)
 
-    @property
-    def _ssql_ctx(self):
-        try:
-            if not hasattr(self, '_scala_HiveContext'):
-                self._scala_HiveContext = self._get_hive_ctx()
-            return self._scala_HiveContext
-        except Py4JError as e:
-            raise Exception("You must build Spark with Hive. "
-                            "Export 'SPARK_HIVE=true' and run "
-                            "build/sbt assembly", e)
+    @classmethod
+    def _createForTesting(cls, sparkContext):
+        """(Internal use only) Create a new HiveContext for testing.
 
-    def _get_hive_ctx(self):
-        return self._jvm.HiveContext(self._jsc.sc())
+        All test code that touches HiveContext *must* go through this method. Otherwise,
+        you may end up launching multiple derby instances and encounter with incredibly
+        confusing error messages.
+        """
+        jsc = sparkContext._jsc.sc()
+        jtestHive = sparkContext._jvm.org.apache.spark.sql.hive.test.TestHiveContext(jsc, False)
+        return cls(sparkContext, jtestHive)
 
     def refreshTable(self, tableName):
         """Invalidate and refresh all the cached the metadata of the given
@@ -597,12 +551,19 @@ class UDFRegistration(object):
 
 
 def _test():
+    import os
     import doctest
+    import tempfile
     from pyspark.context import SparkContext
     from pyspark.sql import Row, SQLContext
     import pyspark.sql.context
+
+    os.chdir(os.environ["SPARK_HOME"])
+
     globs = pyspark.sql.context.__dict__.copy()
     sc = SparkContext('local[4]', 'PythonTest')
+    globs['tempfile'] = tempfile
+    globs['os'] = os
     globs['sc'] = sc
     globs['sqlContext'] = SQLContext(sc)
     globs['rdd'] = rdd = sc.parallelize(
